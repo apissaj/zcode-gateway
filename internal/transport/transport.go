@@ -139,10 +139,15 @@ func errorFromResponse(status int, body []byte) *UpstreamError {
 		message = fmt.Sprintf("account concurrency limit (3008)%s - the desktop client is busy on this account; retry shortly", msgSuffix(env.Msg))
 	case float64(3001):
 		message = fmt.Sprintf("gateway parameter error (3001)%s", msgSuffix(env.Msg))
+	case float64(1005):
+		message = fmt.Sprintf("plan quota exhausted (1005)%s", msgSuffix(env.Msg))
 	default:
-		if env.Error != nil && env.Error.Message != "" {
+		switch {
+		case env.Error != nil && env.Error.Message != "":
 			message = env.Error.Message
-		} else {
+		case strings.TrimSpace(env.Msg) != "":
+			message = fmt.Sprintf("upstream %d%s", status, msgSuffix(env.Msg))
+		default:
 			message = fmt.Sprintf("upstream %d", status)
 		}
 	}

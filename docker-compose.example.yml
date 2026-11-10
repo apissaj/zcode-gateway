@@ -1,0 +1,43 @@
+# Example compose file for zcode-gateway — placeholder values only.
+#
+# Copy it, then fill the .env file with your own bridge token:
+#
+#   cp docker-compose.example.yml docker-compose.yml
+#   printf 'ZCODE_BRIDGE_TOKEN=%s\n' "$(openssl rand -base64 32 | tr -d '/+=' | head -c 36)" > .env
+#   chmod 600 .env
+#   docker compose up -d --build
+#   docker exec -it zcode-gateway /app/zcode-gateway login   # approve the printed URL
+#
+# Nothing in this file is a credential; .env is gitignored and holds the token.
+services:
+  zcode-gateway:
+    build: .
+    image: zcode-gateway:local
+    container_name: zcode-gateway
+    restart: unless-stopped
+    ports:
+      # Publish on all interfaces only if another host or router needs it;
+      # use "127.0.0.1:20131:20131" for a single-machine setup.
+      - "20131:20131"
+    env_file:
+      - .env
+    environment:
+      - PORT=20131
+      - HOST=0.0.0.0                          # loopback would be unreachable through the port publish
+      - ZCODE_DEFAULT_EFFORT=low
+      - ZCODE_MAX_ATTEMPTS=3                  # set 1 when a router in front owns the retry
+      - ZCODE_STATE_DIR=/app/data
+      - ZCODE_ACCOUNTS_FILE=/app/data/accounts.json
+      - ZCODE_PLAN_JWT_FILE=/app/data/plan-jwt.json
+      - ZCODE_IDENTITY_PLATFORM=linux
+      - ZCODE_IDENTITY_DEVICE_MID=00000000-0000-0000-0000-000000000000   # replace: $(uuidgen)
+      - TZ=UTC
+    volumes:
+      # Keep state on a bind so a recreate does not log you out.
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:20131/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

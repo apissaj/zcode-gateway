@@ -59,6 +59,7 @@ type UpstreamError struct {
 	Kind          string // upstream | config | protocol
 	Code          any    // gateway envelope code (3012/1113/3008/3009/3001)
 	LogID         string // upstream logid, kept for tracing/support tickets
+	RetryAfter    int    // seconds the caller should wait before retrying
 	AccountSwitch bool   // internal: rotation may continue with another account
 }
 
@@ -89,6 +90,9 @@ func (e *UpstreamError) HTTPStatus() int {
 
 // RetryAfterSeconds suggests a wait for retryable statuses (0: emit no header).
 func (e *UpstreamError) RetryAfterSeconds() int {
+	if e.RetryAfter > 0 {
+		return e.RetryAfter
+	}
 	switch {
 	case codeIs(e.Code, 3012), codeIs(e.Code, 1005), codeIs(e.Code, 1113):
 		return 60
@@ -325,6 +329,21 @@ func Candidates(jwt, accountID string) ([]candidate, error) {
 		}
 		return out, nil
 	}
+	// Accounts exist but are parked after an upstream rate-limit: that is a
+	// retryable state, not a missing credential. Reporting "run login" here
+	// sends users to re-authenticate an account that is fine.
+	if wait, cooling := accounts.CooldownWait(); cooling {
+		secs := int(wait.Seconds())
+		if secs < 1 {
+			secs = 1
+		}
+		return nil, &UpstreamError{
+			Msg:        fmt.Sprintf("all accounts are cooling down after an upstream rate-limit (%ds left)", secs),
+			Status:     http.StatusTooManyRequests,
+			Kind:       "upstream",
+			RetryAfter: secs,
+		}
+	}
 	legacy := auth.ResolvePlanJWT("")
 	if legacy == "" {
 		return nil, &UpstreamError{
@@ -481,7 +500,11 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 		if !ue.AccountSwitch {
 			return nil, ue // global failure: no point switching
 		}
-		if acct.ID != "" {
+		// Parking only helps when there is somewhere else to go. With a single
+		// account a cooldown blocks every later request for the whole window
+		// (15 minutes by default) while the upstream rate-limit is usually
+		// seconds - and the caller already receives the error below.
+		if acct.ID != "" && len(cands) > 1 {
 			switch {
 			case ue.Status == 401 || ue.Status == 403:
 				accounts.MarkReauth(acct.ID)

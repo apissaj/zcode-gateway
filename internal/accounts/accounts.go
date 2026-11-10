@@ -244,6 +244,29 @@ func List() []Account {
 	return readStore().Accounts
 }
 
+// CooldownWait returns the shortest remaining cooldown across stored accounts
+// and whether any account is parked. Live state only (a restart clears it), and
+// it lets callers answer "rate-limited, retry in Ns" instead of "no credential".
+func CooldownWait() (time.Duration, bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	rec := readStore()
+	now := time.Now()
+	var best time.Duration
+	found := false
+	for _, a := range rec.Accounts {
+		st := runtime[a.ID]
+		if st == nil || !st.cooldownUntil.After(now) {
+			continue
+		}
+		d := st.cooldownUntil.Sub(now)
+		if !found || d < best {
+			best, found = d, true
+		}
+	}
+	return best, found
+}
+
 func cooledDown(id string, now time.Time) bool {
 	st := runtime[id]
 	return st != nil && st.cooldownUntil.After(now)

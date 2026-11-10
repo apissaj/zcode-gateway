@@ -819,3 +819,57 @@ func TestTransientBodyErrorIsRetriedInPlace(t *testing.T) {
 		t.Fatalf("upstream calls = %d, want >= 2: a 3009 body error must be retried", calls)
 	}
 }
+
+// A single-account setup has nowhere to rotate to, so parking it only blocks
+// later requests for the whole cooldown window.
+func TestSingleAccountIsNotParkedAfterSwitchableError(t *testing.T) {
+	singleAccount(t, FAILJWT, "solo")
+	for i := 0; i < 2; i++ {
+		status, text, _ := doRequest(t, "POST", "/v1/chat/completions", map[string]any{
+			"model":    "glm-5.3-flash",
+			"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		})
+		if status != 429 {
+			t.Fatalf("request %d: status = %d, want 429 from upstream; body=%s", i+1, status, text)
+		}
+		if strings.Contains(text, "cooling down") {
+			t.Fatalf("request %d: single account was parked: %s", i+1, text)
+		}
+	}
+	if n := len(seenBearers()); n < 2 {
+		t.Fatalf("upstream calls = %d, want >= 2: a lone account must keep being tried", n)
+	}
+}
+
+// With more than one account, parking is meaningful - and the resulting state
+// must read as a retryable 429, not as "run login".
+func TestCoolingDownReportsRetryable429(t *testing.T) {
+	setupBridge(t)
+	writeAccounts(t, []map[string]any{
+		{"id": "park-a", "label": "park-a", "jwt": FAILJWT, "userId": "u_a",
+			"deviceId": "0a7c2d9d-ce62-4456-aa65-625511ff1ef0", "sessionSeed": "seed-a",
+			"expiresAt": time.Now().UnixMilli() + day(), "needsReauth": false},
+		{"id": "park-b", "label": "park-b", "jwt": FAILJWT, "userId": "u_b",
+			"deviceId": "0a7c2d9d-ce62-4456-aa65-625511ff1ef0", "sessionSeed": "seed-b",
+			"expiresAt": time.Now().UnixMilli() + day(), "needsReauth": false},
+	}, "park-a")
+	resetSeen()
+
+	body := map[string]any{"model": "glm-5.3-flash", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}
+	if status, text, _ := doRequest(t, "POST", "/v1/chat/completions", body); status != 429 {
+		t.Fatalf("first request: status = %d, want 429; body=%s", status, text)
+	}
+	res, text := postRaw(t, "/v1/chat/completions", body)
+	if res.StatusCode != 429 {
+		t.Fatalf("cooled-down request: status = %d, want 429; body=%s", res.StatusCode, text)
+	}
+	if res.Header.Get("Retry-After") == "" {
+		t.Fatal("missing Retry-After while accounts are cooling down")
+	}
+	if !strings.Contains(text, "cooling down") {
+		t.Fatalf("expected a cooling-down message, got: %s", text)
+	}
+	if strings.Contains(text, "login") {
+		t.Fatalf("cooling down must not be reported as a missing credential: %s", text)
+	}
+}

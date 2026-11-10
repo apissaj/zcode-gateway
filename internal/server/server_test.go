@@ -53,9 +53,15 @@ func base64URL(b []byte) string {
 }
 
 var (
-	JWT     = fakeJWT("u_smoke")
-	FAILJWT = fakeJWT("u_spent")
-	EXPIRED = "EXPIRED"
+	JWT         = fakeJWT("u_smoke")
+	FAILJWT     = fakeJWT("u_spent")
+	ENVELOPEJWT = fakeJWT("u_envelope") // answers 200 + {"code":1005,...}
+	BUSYJWT     = fakeJWT("u_busy")     // answers 200 + {"code":3009,...} N times
+	EXPIRED     = "EXPIRED"
+
+	// busyAttempts is how many 3009 envelopes BUSYJWT returns before a normal
+	// answer, so the transient-retry path can be exercised.
+	busyAttempts = 1
 )
 
 type seenState struct {
@@ -64,6 +70,7 @@ type seenState struct {
 	anthropicHdr http.Header
 	bearers      []string
 	refreshCalls int
+	busyCalls    int
 	currentHdr   http.Header
 	balanceHdr   http.Header
 }
@@ -104,6 +111,24 @@ func stubGateway() *httptest.Server {
 		if bearer == "Bearer "+EXPIRED {
 			writeJSON(w, 401, map[string]any{"code": 401, "msg": "token expired"})
 			return
+		}
+		// Quota failure delivered inside a 200 body: the shape the real plan
+		// lane uses, and the case the gateway used to relay as success.
+		if bearer == "Bearer "+ENVELOPEJWT {
+			writeJSON(w, 200, map[string]any{"code": 1005, "msg": "exceed quota limit", "logid": "logid-quota-1"})
+			return
+		}
+		// Capacity failure inside a 200 body, then a normal answer: proves the
+		// transient retry budget is applied to body-level errors too.
+		if bearer == "Bearer "+BUSYJWT {
+			seen.mu.Lock()
+			seen.busyCalls++
+			attempt := seen.busyCalls
+			seen.mu.Unlock()
+			if attempt <= busyAttempts {
+				writeJSON(w, 200, map[string]any{"code": 3009, "msg": "model concurrency limit", "logid": "logid-busy-1"})
+				return
+			}
 		}
 		sys, _ := body["system"].([]any)
 		ok := len(sys) == 3
@@ -293,6 +318,7 @@ func resetSeen() {
 	seen.anthropic = nil
 	seen.bearers = nil
 	seen.refreshCalls = 0
+	seen.busyCalls = 0
 	seen.currentHdr = nil
 	seen.balanceHdr = nil
 }
@@ -690,5 +716,106 @@ func TestAccountPinnedSkipsRotation(t *testing.T) {
 	status, _, _ := doRequest(t, "POST", "/v1/chat/completions?account=spent", map[string]any{"model": "glm-5.3-flash", "messages": []any{map[string]any{"role": "user", "content": "pinned"}}})
 	if status != 429 {
 		t.Fatalf("spent account answers its own error when pinned: %d", status)
+	}
+}
+
+// The plan lane reports quota/capacity failures inside a 200 body. These tests
+// pin the contract that such a body is an error, not a successful answer.
+
+func singleAccount(t *testing.T, jwt, id string) {
+	t.Helper()
+	setupBridge(t)
+	writeAccounts(t, []map[string]any{
+		{"id": id, "label": id, "jwt": jwt, "userId": "u_" + id,
+			"deviceId": "0a7c2d9d-ce62-4456-aa65-625511ff1ef0", "sessionSeed": "seed-" + id,
+			"expiresAt": time.Now().UnixMilli() + day(), "needsReauth": false},
+	}, id)
+	resetSeen()
+}
+
+// postRaw returns the response headers too, which doRequest discards.
+func postRaw(t *testing.T, path string, body map[string]any) (*http.Response, string) {
+	t.Helper()
+	raw, _ := json.Marshal(body)
+	req, err := http.NewRequest("POST", bridgeURL()+path, bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	buf := new(bytes.Buffer)
+	_, _ = buf.ReadFrom(res.Body)
+	return res, buf.String()
+}
+
+func TestQuotaEnvelopeIn200IsNotRelayedAsSuccess(t *testing.T) {
+	singleAccount(t, ENVELOPEJWT, "env")
+	res, text := postRaw(t, "/v1/chat/completions", map[string]any{
+		"model":    "glm-5.3-flash",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if res.StatusCode != 429 {
+		t.Fatalf("status = %d, want 429 retryable; body=%s", res.StatusCode, text)
+	}
+	if res.Header.Get("Retry-After") == "" {
+		t.Fatal("missing Retry-After header on a retryable upstream error")
+	}
+	if !strings.Contains(text, "quota") || !strings.Contains(text, "logid-quota-1") {
+		t.Fatalf("upstream detail lost from the error payload: %s", text)
+	}
+	if strings.Contains(text, `"content":null`) {
+		t.Fatalf("still relayed as an empty completion: %s", text)
+	}
+}
+
+func TestQuotaEnvelopeOnAnthropicLane(t *testing.T) {
+	singleAccount(t, ENVELOPEJWT, "env-anthropic")
+	res, text := postRaw(t, "/v1/messages", map[string]any{
+		"model": "glm-5.3-flash", "max_tokens": 16,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if res.StatusCode != 429 {
+		t.Fatalf("status = %d, want 429; body=%s", res.StatusCode, text)
+	}
+	if !strings.Contains(text, "error") {
+		t.Fatalf("anthropic error shape missing: %s", text)
+	}
+}
+
+func TestQuotaEnvelopeOnStreamingRequestWritesNoStream(t *testing.T) {
+	singleAccount(t, ENVELOPEJWT, "env-stream")
+	res, text := postRaw(t, "/v1/chat/completions", map[string]any{
+		"model": "glm-5.3-flash", "stream": true,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if res.StatusCode != 429 {
+		t.Fatalf("streaming status = %d, want 429; body=%s", res.StatusCode, text)
+	}
+	if ct := res.Header.Get("Content-Type"); strings.Contains(ct, "event-stream") {
+		t.Fatalf("committed an SSE stream for an upstream error (content-type %q)", ct)
+	}
+}
+
+func TestTransientBodyErrorIsRetriedInPlace(t *testing.T) {
+	old := busyAttempts
+	busyAttempts = 1
+	defer func() { busyAttempts = old }()
+	singleAccount(t, BUSYJWT, "busy")
+	status, text, _ := doRequest(t, "POST", "/v1/chat/completions", map[string]any{
+		"model":    "glm-5.3-flash",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if status != 200 {
+		t.Fatalf("status = %d, want 200 after in-place retry; body=%s", status, text)
+	}
+	seen.mu.Lock()
+	calls := seen.busyCalls
+	seen.mu.Unlock()
+	if calls < 2 {
+		t.Fatalf("upstream calls = %d, want >= 2: a 3009 body error must be retried", calls)
 	}
 }

@@ -14,11 +14,14 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -158,23 +161,38 @@ func extractJSONField(s, field string) string {
 	return rest[:k]
 }
 
-// relayUpstreamError copies an upstream error into the caller's dialect.
+// relayUpstreamError copies an upstream error into the caller's dialect, with a
+// status the downstream router can act on (429 for capacity, 402 for a dead
+// allowance, 502 otherwise) instead of a misleading 200.
 func relayUpstreamError(w http.ResponseWriter, err error, dialect string) {
 	message := err.Error()
-	status := 502
+	status := http.StatusBadGateway
 	var code any
 	if ue, ok := err.(*transport.UpstreamError); ok {
-		if ue.Status > 0 {
-			status = ue.Status
-		}
+		status = ue.HTTPStatus()
 		code = ue.Code
+		if ue.LogID != "" {
+			// Upstream logid is the only handle support can trace: keep it on
+			// the gateway log and expose it in the client payload.
+			message = fmt.Sprintf("%s (logid=%s)", message, ue.LogID)
+			log.Printf("upstream error code=%v logid=%s status=%d msg=%q", ue.Code, ue.LogID, status, ue.Msg)
+		} else {
+			log.Printf("upstream error code=%v status=%d msg=%q", ue.Code, status, ue.Msg)
+		}
+		if ra := ue.RetryAfterSeconds(); ra > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(ra))
+		}
 	}
 	if dialect == "openai" {
 		openAIError(w, status, message, code)
 		return
 	}
 	typ := "api_error"
-	if f, ok := code.(float64); ok && f == 3012 {
+	if status == http.StatusTooManyRequests {
+		typ = "rate_limit_error"
+	} else if status == http.StatusPaymentRequired {
+		typ = "permission_error"
+	} else if f, ok := code.(float64); ok && f == 3012 {
 		typ = "rate_limit_error"
 	}
 	anthropicError(w, status, message, typ)
@@ -214,6 +232,20 @@ func handleMessages(w http.ResponseWriter, r *http.Request, body map[string]any,
 		anthropicError(w, 502, "Upstream returned a non-JSON response", "")
 		return
 	}
+	// A 200 body can still be a gateway error envelope: never relay it to the
+	// caller as if it were a successful message.
+	if ue := transport.BodyErrorEnvelope(upstream.StatusCode, raw); ue != nil {
+		relayUpstreamError(w, ue, "anthropic")
+		return
+	}
+	var probe map[string]any
+	if json.Unmarshal(raw, &probe) == nil && !looksLikeMessage(probe) {
+		relayUpstreamError(w, &transport.UpstreamError{
+			Msg:    "upstream returned an unrecognised payload",
+			Status: http.StatusBadGateway, Kind: "protocol",
+		}, "anthropic")
+		return
+	}
 	sendJSON(w, 200, json.RawMessage(raw))
 }
 
@@ -247,7 +279,37 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request, body map[stri
 		openAIError(w, 502, "Upstream returned a non-JSON response", nil)
 		return
 	}
+	// Same rule as the Anthropic lane: an error envelope inside a 200 body must
+	// surface as an error, not as an assistant turn with empty content.
+	if ue := transport.BodyErrorEnvelope(upstream.StatusCode, raw); ue != nil {
+		relayUpstreamError(w, ue, "openai")
+		return
+	}
+	if !looksLikeMessage(result) {
+		relayUpstreamError(w, &transport.UpstreamError{
+			Msg:    "upstream returned an unrecognised payload",
+			Status: http.StatusBadGateway, Kind: "protocol",
+		}, "openai")
+		return
+	}
 	sendJSON(w, 200, models.AnthropicToOpenAI(result, model))
+}
+
+// looksLikeMessage reports whether an upstream body is a usable Anthropic
+// message rather than an empty or unrelated envelope.
+func looksLikeMessage(m map[string]any) bool {
+	if m == nil {
+		return false
+	}
+	for _, key := range []string{"content", "usage", "id", "stop_reason"} {
+		if _, ok := m[key]; ok {
+			return true
+		}
+	}
+	if t, _ := m["type"].(string); t == "message" || t == "error" {
+		return true
+	}
+	return false
 }
 
 func stringOf(v any) string {
@@ -264,6 +326,15 @@ func isJSON(raw []byte) bool {
 // pass through untouched; OpenAI callers get frames rewritten into
 // chat.completion.chunk.
 func pipeStream(w http.ResponseWriter, upstream *http.Response, dialect, model string) {
+	// Peek the first SSE event before committing a 200: the plan lane can answer
+	// a streaming request with a plain error envelope, and once 200 + SSE headers
+	// are written the caller only ever sees a successful-looking empty stream.
+	reader, pre := peekFirstEvent(upstream.Body)
+	if ue := firstEventError(pre); ue != nil {
+		relayUpstreamError(w, ue, dialect)
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
@@ -271,7 +342,6 @@ func pipeStream(w http.ResponseWriter, upstream *http.Response, dialect, model s
 	w.WriteHeader(200)
 	flusher, _ := w.(http.Flusher)
 
-	reader := upstream.Body
 	buf := make([]byte, 16<<10)
 	var carry string
 	streamState := &chunkState{toolByBlock: map[float64]int{}, nextToolIndex: 0}
@@ -357,6 +427,46 @@ func pipeStream(w http.ResponseWriter, upstream *http.Response, dialect, model s
 			return
 		}
 	}
+}
+
+// peekFirstEvent reads until the first complete SSE event (or EOF / 64 KiB) and
+// returns a reader that replays those bytes before the rest of the body.
+func peekFirstEvent(body io.Reader) (io.Reader, []byte) {
+	head := make([]byte, 0, 16<<10)
+	buf := make([]byte, 4<<10)
+	for len(head) < 64<<10 {
+		n, err := body.Read(buf)
+		if n > 0 {
+			head = append(head, buf[:n]...)
+			if bytes.Contains(head, []byte("\n\n")) {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	return io.MultiReader(bytes.NewReader(head), body), head
+}
+
+// firstEventError extracts an upstream error envelope out of a peeked SSE head
+// (or a plain JSON body the lane returned for a streaming request).
+func firstEventError(pre []byte) *transport.UpstreamError {
+	s := strings.TrimSpace(string(pre))
+	if s == "" {
+		return nil
+	}
+	if idx := strings.Index(s, "data:"); idx >= 0 {
+		s = s[idx+len("data:"):]
+		if j := strings.IndexByte(s, '\n'); j >= 0 {
+			s = s[:j]
+		}
+	}
+	s = strings.TrimSpace(s)
+	if s == "" || s == "[DONE]" || !strings.HasPrefix(s, "{") {
+		return nil
+	}
+	return transport.BodyErrorEnvelope(http.StatusOK, []byte(s))
 }
 
 // flushOpenAIFrame converts one buffered SSE frame (possibly without its

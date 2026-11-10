@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -18,9 +19,53 @@ import (
 
 // Route dispatches one request; handler errors that happen after the
 // headers are sent are impossible here because every handler writes its
-// own status first.
+// own status first. Every call is logged so a failing request can be
+// diagnosed from the container logs alone.
 func Route() http.Handler {
-	return http.HandlerFunc(route)
+	return logRequests(http.HandlerFunc(route))
+}
+
+// statusWriter records the status the handler actually sent.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusWriter) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusWriter) Write(b []byte) (int, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+// Flush keeps streaming handlers working through the wrapper.
+func (s *statusWriter) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// logRequests emits one line per request (method, path, status, duration,
+// account pin). Without it the gateway only prints its startup banner, which
+// makes an empty or odd answer impossible to trace.
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w}
+		next.ServeHTTP(sw, r)
+		status := sw.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		log.Printf("req method=%s path=%s status=%d dur=%s account=%s",
+			r.Method, r.URL.Path, status, time.Since(start).Round(time.Millisecond),
+			firstNonEmpty(r.URL.Query().Get("account"), r.Header.Get("X-Zcode-Account"), "-"))
+	})
 }
 
 func route(w http.ResponseWriter, r *http.Request) {

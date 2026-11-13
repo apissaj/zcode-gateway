@@ -1,9 +1,11 @@
 # Secrets — never commit
 plan-jwt.json
+plan-jwt.json.*
 data/accounts.json
 data/*-jwt.json
 *.jwt
 .env
+credential-secret
 
 # Build output
 /zcode-gateway
@@ -21,5 +23,7 @@ Thumbs.db
 credentials.js
 scripts/
 *.log
+*.out
+*.err
 *.exe
 zcode-bridge*

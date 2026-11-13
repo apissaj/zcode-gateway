@@ -58,10 +58,53 @@ type UpstreamError struct {
 	Body          any
 	Kind          string // upstream | config | protocol
 	Code          any    // gateway envelope code (3012/1113/3008/3009/3001)
+	LogID         string // upstream logid, kept for tracing/support tickets
+	RetryAfter    int    // seconds the caller should wait before retrying
 	AccountSwitch bool   // internal: rotation may continue with another account
 }
 
 func (e *UpstreamError) Error() string { return e.Msg }
+
+// HTTPStatus maps the error onto a status a downstream router can act on. The
+// plan lane reports capacity/quota failures inside a 200 body, so the upstream
+// status alone is unusable: capacity codes must stay retryable and a
+// 200-with-error must never reach the client as success.
+func (e *UpstreamError) HTTPStatus() int {
+	switch {
+	case codeIs(e.Code, 1005): // allowance exhausted / not entitled right now
+		return http.StatusTooManyRequests
+	case codeIs(e.Code, 3008): // account slot parked by the desktop client
+		return http.StatusTooManyRequests
+	case codeIs(e.Code, 3009): // model concurrency, retry shortly
+		return http.StatusTooManyRequests
+	case codeIs(e.Code, 3012): // blocked, wait a minute and retry
+		return http.StatusTooManyRequests
+	case codeIs(e.Code, 1113): // this account's allowance is spent (already 429 upstream)
+		return http.StatusTooManyRequests
+	}
+	if e.Status >= 400 && e.Status <= 599 {
+		return e.Status
+	}
+	return http.StatusBadGateway
+}
+
+// RetryAfterSeconds suggests a wait for retryable statuses (0: emit no header).
+func (e *UpstreamError) RetryAfterSeconds() int {
+	if e.RetryAfter > 0 {
+		return e.RetryAfter
+	}
+	switch {
+	case codeIs(e.Code, 3012), codeIs(e.Code, 1005), codeIs(e.Code, 1113):
+		return 60
+	case codeIs(e.Code, 3008), codeIs(e.Code, 3009):
+		return 2
+	}
+	if e.Status == http.StatusTooManyRequests {
+		return 2
+	}
+	return 0
+}
+
 
 func envOr(key, fallback string) string {
 	if v := strings.TrimSpace(osGetenv(key)); v != "" {
@@ -76,6 +119,7 @@ func errorFromResponse(status int, body []byte) *UpstreamError {
 	var env struct {
 		Code  any    `json:"code"`
 		Msg   string `json:"msg"`
+		LogID string `json:"logid"`
 		Error *struct {
 			Message string `json:"message"`
 			Type    string `json:"type"`
@@ -99,14 +143,70 @@ func errorFromResponse(status int, body []byte) *UpstreamError {
 		message = fmt.Sprintf("account concurrency limit (3008)%s - the desktop client is busy on this account; retry shortly", msgSuffix(env.Msg))
 	case float64(3001):
 		message = fmt.Sprintf("gateway parameter error (3001)%s", msgSuffix(env.Msg))
+	case float64(1005):
+		message = fmt.Sprintf("plan quota exhausted (1005)%s", msgSuffix(env.Msg))
 	default:
-		if env.Error != nil && env.Error.Message != "" {
+		switch {
+		case env.Error != nil && env.Error.Message != "":
 			message = env.Error.Message
-		} else {
+		case strings.TrimSpace(env.Msg) != "":
+			message = fmt.Sprintf("upstream %d%s", status, msgSuffix(env.Msg))
+		default:
 			message = fmt.Sprintf("upstream %d", status)
 		}
 	}
-	return &UpstreamError{Msg: message, Status: status, Body: env, Kind: "upstream", Code: code}
+	return &UpstreamError{Msg: message, Status: status, Body: env, Kind: "upstream", Code: code, LogID: env.LogID}
+}
+
+// BodyErrorEnvelope reports a gateway error carried inside a 2xx body. The plan
+// lane answers quota/capacity failures with HTTP 200 plus a
+// {"code":...,"msg":...,"logid":...} envelope, so the status alone cannot be
+// trusted. Returns nil for a normal payload.
+func BodyErrorEnvelope(status int, body []byte) *UpstreamError {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil
+	}
+	var probe struct {
+		Code  any             `json:"code"`
+		Type  string          `json:"type"`
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(trimmed, &probe) != nil {
+		return nil
+	}
+	if probe.Code != nil {
+		if codeIs(probe.Code, 0) {
+			return nil // {"code":0,...} is a success envelope
+		}
+		return errorFromResponse(status, trimmed)
+	}
+	// No code: only treat it as an error when the body is not a normal
+	// Anthropic message (which always carries "type":"message").
+	if len(probe.Error) > 0 && (probe.Type == "" || probe.Type == "error") {
+		return errorFromResponse(status, trimmed)
+	}
+	return nil
+}
+
+// sniffBodyError peeks a non-streaming 2xx body for an error envelope and
+// returns the bytes to replay, so the caller can still consume the response.
+func sniffBodyError(res *http.Response) (*UpstreamError, []byte) {
+	if res == nil || res.Body == nil {
+		return nil, nil
+	}
+	if strings.Contains(strings.ToLower(res.Header.Get("Content-Type")), "event-stream") {
+		return nil, nil // streamed: the server peeks the first SSE event instead
+	}
+	raw, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
+	res.Body.Close()
+	if err != nil {
+		return &UpstreamError{Msg: "upstream body read failed: " + err.Error(), Status: http.StatusBadGateway, Kind: "upstream"}, nil
+	}
+	if ue := BodyErrorEnvelope(res.StatusCode, raw); ue != nil {
+		return ue, nil
+	}
+	return nil, raw
 }
 
 func msgSuffix(msg string) string {
@@ -151,9 +251,26 @@ func isSwitchable(err *UpstreamError, status int) bool {
 	return false
 }
 
+// codeIs compares a gateway envelope code against a number, tolerating the
+// shapes JSON decoders hand back (float64/float32/int/int64/json.Number/string).
 func codeIs(code any, want float64) bool {
-	f, ok := code.(float64)
-	return ok && f == want
+	switch v := code.(type) {
+	case float64:
+		return v == want
+	case float32:
+		return float64(v) == want
+	case int:
+		return float64(v) == want
+	case int64:
+		return float64(v) == want
+	case json.Number:
+		f, err := v.Float64()
+		return err == nil && f == want
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		return err == nil && f == want
+	}
+	return false
 }
 
 // candidate is one account attempt for a request.
@@ -211,6 +328,21 @@ func Candidates(jwt, accountID string) ([]candidate, error) {
 			out = append(out, candidate{ID: a.ID, Label: a.Label, JWT: a.JWT, DeviceID: a.DeviceID, SessionSeed: a.SessionSeed, UserID: a.UserID})
 		}
 		return out, nil
+	}
+	// Accounts exist but are parked after an upstream rate-limit: that is a
+	// retryable state, not a missing credential. Reporting "run login" here
+	// sends users to re-authenticate an account that is fine.
+	if wait, cooling := accounts.CooldownWait(); cooling {
+		secs := int(wait.Seconds())
+		if secs < 1 {
+			secs = 1
+		}
+		return nil, &UpstreamError{
+			Msg:        fmt.Sprintf("all accounts are cooling down after an upstream rate-limit (%ds left)", secs),
+			Status:     http.StatusTooManyRequests,
+			Kind:       "upstream",
+			RetryAfter: secs,
+		}
 	}
 	legacy := auth.ResolvePlanJWT("")
 	if legacy == "" {
@@ -368,7 +500,11 @@ func SendAnthropic(o SendOpts) (*http.Response, error) {
 		if !ue.AccountSwitch {
 			return nil, ue // global failure: no point switching
 		}
-		if acct.ID != "" {
+		// Parking only helps when there is somewhere else to go. With a single
+		// account a cooldown blocks every later request for the whole window
+		// (15 minutes by default) while the upstream rate-limit is usually
+		// seconds - and the caller already receives the error below.
+		if acct.ID != "" && len(cands) > 1 {
 			switch {
 			case ue.Status == 401 || ue.Status == 403:
 				accounts.MarkReauth(acct.ID)
@@ -407,9 +543,22 @@ func runAccount(ctx context.Context, client *http.Client, acct candidate, o Send
 	for n := 0; n < maxAttempts; n++ {
 		res, attemptErr := attemptOnce(ctx, client, acct, bearer, o, timeout)
 		if res != nil && res.StatusCode >= 200 && res.StatusCode < 300 {
-			return res, nil
-		}
-		if attemptErr != nil {
+			// A 2xx body can still be a gateway error envelope (the plan lane
+			// reports capacity/quota failures that way), so peek before
+			// declaring success: transient codes must retry in place and
+			// capacity codes must reach the caller as a retryable status.
+			ue, replay := sniffBodyError(res)
+			if ue == nil {
+				if replay != nil {
+					res.Body = io.NopCloser(bytes.NewReader(replay))
+				}
+				return res, nil
+			}
+			lastErr = ue
+			if isSwitchable(lastErr, lastErr.Status) {
+				lastErr.AccountSwitch = true
+			}
+		} else if attemptErr != nil {
 			if ctx.Err() != nil {
 				return nil, attemptErr // client hung up or deadline
 			}

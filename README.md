@@ -82,8 +82,13 @@ curl -X POST http://127.0.0.1:8085/v1/messages \
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `20131` | Listening port |
-| `BIND_HOST` | `127.0.0.1` | Network interface to bind |
+| `HOST` | `127.0.0.1` | Network interface to bind (set `0.0.0.0` to serve the LAN) |
+| `ZCODE_BRIDGE_TOKEN` | - | When set, inference routes require `Authorization: Bearer <token>` or `x-api-key: <token>`. Leave unset only on a single-user loopback host |
 | `ZCODE_DEFAULT_EFFORT` | `low` | Default reasoning effort when unspecified (`low`, `high`, `max`) |
+| `ZCODE_MAX_ATTEMPTS` | `3` | In-place retries per account before a retryable error is returned (`429` + `Retry-After`); set `1` when a router in front owns the retry |
+| `ZCODE_CORS_ORIGIN` | - | Opt-in browser support: `*` or a comma-separated origin list |
+| `ZCODE_STATE_DIR` | `~/.zcode/v2` | Where the account store and plan JWT live |
+| `ZCODE_ACCOUNTS_FILE` | `<state dir>/accounts.json` | Account store written by `login` |
 | `ZCODE_PLAN_JWT` | - | Manual Plan JWT override |
 | `ZCODE_IDENTITY_DEVICE_MID` | Auto | Device identifier (auto-detected on Windows) |
 
